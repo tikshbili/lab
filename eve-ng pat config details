@@ -1,0 +1,140 @@
+**https://theworldsgonemad.net/2021/eve-cloud-nat/**
+
+
+EVE has 10 bridges that are associated on a one-to-one basis to each physical NIC or vNIC. In the CLI these are called PNETs and in the GUI clouds. For example, cloud0 is mapped to pnet0 that is associated to eth0 which is the management NIC you use to connect to EVE.
+
+root@hme-ubt-eve01:~# brctl show
+bridge name   bridge id           STP enabled     interfaces
+pnet0         8000.005056a39b79   no              eth0
+pnet1         8000.005056a34db2   no              eth1
+pnet2         8000.005056a346b5   no              eth2
+pnet3         8000.000000000000   no
+pnet4         8000.000000000000   no
+pnet5         8000.000000000000   no
+pnet6         8000.000000000000   no
+pnet7         8000.000000000000   no
+pnet8         8000.000000000000   no
+pnet9         8000.000000000000   no
+
+brctl is a tool used for managing the ethernet bridge configuration in the linux kernel, this link provides some some other useful brctl commands.
+
+Cloud NAT takes one of these clouds and uses it for the purpose of Internet breakout. I find it a quick and simple way to give any lab device Internet access as all you need to do is to enable DHCP on the lab device and attach it to the cloud network.
+DHCP Server
+
+The first thing you need to do is install the DHCP server.
+
+apt-get install isc-dhcp-server
+
+Within the /etc/default/isc-dhcp-server DHCP server file define on which bridge the DHCP server should serve DHCP requests by adding this line to the bottom of the file. This is the pnet/cloud that you will put lab device in to give them Internet access.
+
+INTERFACES='pnet9'
+
+The /etc/dhcp/dhcpd.conf DHCP configuration file defines the IP address information to be given out to the DHCP clients and makes EVE the authoritative server for that local network.
+
+authoritative;
+
+subnet 192.168.99.0 netmask 255.255.255.0 {
+  range 192.168.99.100 192.168.99.254;
+  interface pnet9;
+  default-lease-time 600;
+  max-lease-time 7200;
+  option domain-name 'stesworld.com';
+  option domain-name-servers 8.8.8.8, 1.1.1.1;
+  option broadcast-address 192.168.99.255;
+  option subnet-mask 255.255.255.0;
+  option routers 192.168.99.1;}
+
+The following commands can be used to verify and troubleshoot the DHCP process.
+
+dhcpd -t                                           Check the syntax of dhcpd.conf file for errors
+systemctl start isc-dhcp-server                    Start the service
+systemctl enable isc-dhcp-server                   Enable it to start at each boot
+
+service isc-dhcp-server status                     Check the service is running with no errors
+cat /var/lib/dhcp/dhcpd.leases                     See the IP addresses assigned by DHCP and their lease times
+
+The DHCP service status will show as status=1/FAILURE) with the error Not configured to listen on any interfaces! until the interface (pnet9) has been assigned an IP address.
+Apply temporary
+
+The following configuration will not survive a reboot so is useful if you want to first test the solution works.
+
+    Add an IP address from within the DHCP range to the pnet bridge interface
+
+    ip address add 192.168.99.1/24 dev pnet9
+
+    Enable IP routing in the linux kernel
+
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+
+    PAT the DHCP range to the pnet0 IP address (EVE management interface address)
+
+    iptables -t nat -A POSTROUTING -o pnet0 -s 192.168.99.0/24 -j MASQUERADE
+
+Apply permanent
+
+The following configuration applies cloud NAT permanently so that it will survive reboots.
+
+    Add an IP address within the DHCP range to the pnet bridge interface by editing /etc/network/interfaces
+
+    iface eth9 inet manual
+    auto pnet9
+    iface pnet9 inet static
+        address 192.168.99.1
+        netmask 255.255.255.0
+        bridge_ports eth9
+        bridge_stp off
+
+    Enable IP routing in linux kernel by editing /etc/sysctl.conf
+
+    net.ipv4.ip_forward = 1
+
+    PAT the DHCP range to the pnet0 IP address (EVE mgmt interface address) by installing and editing iptables-persistent
+
+    apt-get install iptables-persistent
+    iptables -t nat -A POSTROUTING -o pnet0 -s 192.168.99.0/24 -j MASQUERADE
+    netfilter-persistent save
+
+Verification
+
+iptables -t nat -L                                         To check IP table rules
+iptables -t nat -v -L POSTROUTING -n --line-number         Show the statistics (pkts/bytes), NATs and the line-number
+
+cat /var/lib/dhcp/dhcpd.leases                             Holds the IP addresses assigned by DHCP and their lease times
+
+brctl show                                                 Displays the association between physical interfaces, pnets and lab device ports
+brctl showmacs pnet1                                       Shows MAC addresses in this bridge
+
+Port based NATs
+
+In some situations you may want port based NATs to allow RDP, SSH or HTTPS access to a device within your EVE lab. I find this particularly useful when hosting EVE in Azure. Below are a few useful examples of what you can do, they once again use iptables.
+
+    Traffic to 10.20.10.5 on port 3389 is forwarded to 192.168.99.254 on 3389
+
+    iptables -t nat -A POSTROUTING -p tcp -d 10.20.10.5 --dport 3389 -j DNAT --to-destination 192.168.99.254:3389
+
+    HTTPS traffic is forwarded to lab device 192.168.99.99. Note, this will break all internet access to 443 as it applies to all HTTPS traffic
+
+    iptables -t nat -A PREROUTING -p tcp --dport 443 -j DNAT --to 192.168.99.99
+
+    Connections inbound on port 444 are forwarded to 192.168.99.99 on port 443 (so that it doesn’t break HTTPS for other devices)
+
+    iptables -t nat -A PREROUTING -p tcp --dport 444 -j DNAT --to 192.168.99.99:443
+
+    Connections inbound on port 23 are forwarded to 192.168.99.97 on port 22 (so that it doesn’t break SHH access to EVE itself)
+
+    iptables -t nat -A PREROUTING -p tcp --dport 23 -j DNAT --to 192.168.99.97:22
+
+    Also ties the NAT to an exact interface (pnet1)
+
+    iptables -t nat -A PREROUTING -p tcp -i pnet1 --dport 443 -j DNAT --to 192.168.99.99
+
+    Forwards traffic from the specific source address 115.4.117.132 on port 443 to 192.168.99.99
+
+    iptables -t nat -A PREROUTING -s 115.4.117.132 -p tcp --dport 443 -j DNAT --to 192.168.99.99
+
+To delete any of the iptable entries you need to get the rule line-number with the first command and use that in the second command to delete it.
+
+iptables -t nat -v -L PREROUTING -n --line-number
+iptables -t nat -D PREROUTING the_line_number
+
+    ← Previous Post
